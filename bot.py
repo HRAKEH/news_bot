@@ -61,6 +61,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS updates_seen (
             update_id INTEGER PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS ui_messages (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (chat_id, message_id)
+        );
         """)
         con.commit()
 
@@ -105,13 +111,57 @@ def main_keys(chat_id):
     ])
 
 
-def send(chat_id, text, keys=None):
+def remember_ui(chat_id, sent):
+    """Remember only interactive messages. Scheduled news remain untouched."""
+    if not isinstance(sent, dict) or not sent.get("message_id"):
+        return
+    with closing(db()) as con:
+        con.execute(
+            "INSERT OR IGNORE INTO ui_messages (chat_id,message_id) VALUES (?,?)",
+            (chat_id, int(sent["message_id"]))
+        )
+        con.commit()
+
+
+def clear_ui(chat_id):
+    """Clean old menu and manually viewed reports on every navigation.
+
+    Telegram can refuse deleting messages older than 48 hours. In that case
+    try to remove inline buttons. Never delete scheduled news notifications.
+    """
+    with closing(db()) as con:
+        rows = con.execute(
+            "SELECT message_id FROM ui_messages WHERE chat_id=? ORDER BY message_id",
+            (chat_id,)
+        ).fetchall()
+    for row in rows:
+        message_id = row["message_id"]
+        try:
+            api("deleteMessage", chat_id=chat_id, message_id=message_id)
+        except Exception as exc:
+            log.info("Cannot delete old menu %s/%s: %s", chat_id, message_id, exc)
+            try:
+                api("editMessageReplyMarkup", chat_id=chat_id,
+                    message_id=message_id, reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+        finally:
+            with closing(db()) as con:
+                con.execute("DELETE FROM ui_messages WHERE chat_id=? AND message_id=?",
+                            (chat_id, message_id))
+                con.commit()
+
+
+def send(chat_id, text, keys=None, track=False):
     payload = {
         "chat_id": chat_id, "text": text, "disable_web_page_preview": True
     }
     if keys is not None:
         payload["reply_markup"] = keys
-    return api("sendMessage", **payload)
+    result = api("sendMessage", **payload)
+    if track:
+        remember_ui(chat_id, result)
+    return result
 
 
 def split_text(text, max_size=3400):
@@ -127,10 +177,12 @@ def split_text(text, max_size=3400):
         remaining = remaining[cut:].lstrip("\n")
 
 
-def send_long(chat_id, text):
+def send_long(chat_id, text, track=False):
     chunks = list(split_text(text)) or ["(Пустое сообщение)"]
     for index, chunk in enumerate(chunks):
-        send(chat_id, chunk, main_keys(chat_id) if index == len(chunks) - 1 else None)
+        send(chat_id, chunk,
+             main_keys(chat_id) if index == len(chunks) - 1 else None,
+             track=track)
 
 
 def message_text(row):
@@ -154,32 +206,19 @@ def register_user(chat_id, user_id):
 
 
 def answer_panel(chat_id, text, keys=None, callback=None):
-    previous = (callback or {}).get("message", {})
-    previous_text = str(previous.get("text") or "")
-    can_edit = previous_text.startswith(("🧭", "📚", "⚙️", "ℹ️", "🔔"))
-    if can_edit and previous.get("message_id"):
-        try:
-            api(
-                "editMessageText", chat_id=chat_id,
-                message_id=previous["message_id"], text=text,
-                reply_markup=keys or main_keys(chat_id),
-                disable_web_page_preview=True
-            )
-            return
-        except RuntimeError as exc:
-            if "message is not modified" in str(exc).lower():
-                return
-            log.info("editMessageText unavailable: %s", exc)
-    send(chat_id, text, keys or main_keys(chat_id))
+    # Previous interactive messages are removed in process_update().
+    # Always send a new, tracked panel to keep the chat free of stale menus.
+    send(chat_id, text, keys or main_keys(chat_id), track=True)
 
 
 def latest(chat_id):
     with closing(db()) as con:
         row = con.execute("SELECT * FROM news ORDER BY id DESC LIMIT 1").fetchone()
     if row:
-        send_long(chat_id, message_text(row))
+        send_long(chat_id, message_text(row), track=True)
     else:
-        send(chat_id, "Обзоров пока нет. Проверьте настройки Gmail.", main_keys(chat_id))
+        send(chat_id, "Обзоров пока нет. Проверьте настройки Gmail.",
+             main_keys(chat_id), track=True)
 
 
 def archive(chat_id, page, callback):
@@ -263,6 +302,7 @@ def process_update(update):
         return
     if callback:
         api("answerCallbackQuery", callback_query_id=callback["id"])
+        clear_ui(chat_id)
         action = callback.get("data") or ""
         if action == "home":
             answer_panel(chat_id, "🧭 Новости и аналитика\nВыберите действие:", callback=callback)
@@ -304,12 +344,15 @@ def process_update(update):
                     "SELECT * FROM news WHERE id=?", (news_id,)
                 ).fetchone()
             if item:
-                send_long(chat_id, message_text(item))
+                send_long(chat_id, message_text(item), track=True)
         return
+
+    clear_ui(chat_id)
     if str(message.get("text", "")).startswith("/start"):
-        send(chat_id, "✅ Бот подключён.\nВыберите действие:", main_keys(chat_id))
+        send(chat_id, "✅ Бот подключён.\nВыберите действие:",
+             main_keys(chat_id), track=True)
     else:
-        send(chat_id, "Выберите действие:", main_keys(chat_id))
+        send(chat_id, "Выберите действие:", main_keys(chat_id), track=True)
 
 
 @app.get("/health")
